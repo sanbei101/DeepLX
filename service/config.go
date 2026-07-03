@@ -1,15 +1,3 @@
-/*
- * @Author: Vincent Yang
- * @Date: 2024-04-23 00:39:03
- * @LastEditors: Jason Lyu
- * @LastEditTime: 2025-04-08 13:45:00
- * @FilePath: /DeepLX/config.go
- * @Telegram: https://t.me/missuo
- * @GitHub: https://github.com/missuo
- *
- * Copyright © 2024 by Vincent, All Rights Reserved.
- */
-
 package service
 
 import (
@@ -19,11 +7,10 @@ import (
 )
 
 type Config struct {
-	IP        string
-	Port      int
-	Token     string
-	DlSession string
-	Proxy     string
+	IP    string
+	Port  int
+	Token string
+	Proxy string
 }
 
 func InitConfig() *Config {
@@ -32,38 +19,30 @@ func InitConfig() *Config {
 		Port: 1188,
 	}
 
-	// IP flag
+	// IP 参数
 	if ip, ok := os.LookupEnv("IP"); ok && ip != "" {
 		cfg.IP = ip
 	}
-	flag.StringVar(&cfg.IP, "ip", cfg.IP, "set up the IP address to bind to")
-	flag.StringVar(&cfg.IP, "i", cfg.IP, "set up the IP address to bind to")
+	flag.StringVar(&cfg.IP, "ip", cfg.IP, "绑定服务的 IP 地址")
+	flag.StringVar(&cfg.IP, "i", cfg.IP, "绑定服务的 IP 地址")
 
-	// Port flag
+	// 端口参数
 	if port, ok := os.LookupEnv("PORT"); ok && port != "" {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
-	flag.IntVar(&cfg.Port, "port", cfg.Port, "set up the port to listen on")
-	flag.IntVar(&cfg.Port, "p", cfg.Port, "set up the port to listen on")
+	flag.IntVar(&cfg.Port, "port", cfg.Port, "监听端口")
+	flag.IntVar(&cfg.Port, "p", cfg.Port, "监听端口")
 
-	// DL Session flag
-	flag.StringVar(&cfg.DlSession, "s", "", "set the dl-session for /v1/translate endpoint")
-	if cfg.DlSession == "" {
-		if dlSession, ok := os.LookupEnv("DL_SESSION"); ok {
-			cfg.DlSession = dlSession
-		}
-	}
-
-	// Access token flag
-	flag.StringVar(&cfg.Token, "token", "", "set the access token for /translate endpoint")
+	// 访问令牌参数
+	flag.StringVar(&cfg.Token, "token", "", "/translate 端点的访问令牌")
 	if cfg.Token == "" {
 		if token, ok := os.LookupEnv("TOKEN"); ok {
 			cfg.Token = token
 		}
 	}
 
-	// HTTP Proxy flag
-	flag.StringVar(&cfg.Proxy, "proxy", "", "set the proxy URL for HTTP requests")
+	// HTTP 代理参数
+	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP 请求的代理 URL")
 	if cfg.Proxy == "" {
 		if proxy, ok := os.LookupEnv("PROXY"); ok {
 			cfg.Proxy = proxy

@@ -1,15 +1,3 @@
-/*
- * @Author: Vincent Young
- * @Date: 2024-09-16 11:59:24
- * @LastEditors: Vincent Yang
- * @LastEditTime: 2026-05-22 00:00:00
- * @FilePath: /DeepLX/translate/translate.go
- * @Telegram: https://t.me/missuo
- * @GitHub: https://github.com/missuo
- *
- * Copyright © 2024 by Vincent, All Rights Reserved.
- */
-
 package translate
 
 import (
@@ -36,75 +24,51 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// DeepL's interactive web translator migrated to a SignalR/WebSocket
-// channel and the legacy LMT_handle_texts backend on www2.deepl.com now
-// 429s anonymous traffic within a handful of calls. The official Chrome
-// extension instead POSTs to a stateless "oneshot" endpoint that lives
-// on a separate rate-limit pool and accepts the literal header
-// `Authorization: None` for anonymous requests — that is what we target.
+// DeepL 的交互式网页翻译器已迁移到 SignalR/WebSocket 频道,
+// 而 www2.deepl.com 上的传统 LMT_handle_texts 后端现在会对匿名请求快速返回 429。
+// 官方 Chrome 扩展则向一个无状态的 "oneshot" 端点发送 POST 请求,
+// 该端点位于独立的速率限制池中,并对匿名请求接受字面量头
+// `Authorization: None`--这就是我们的目标。
 //
-// The request we send is reverse-engineered from the extension's
-// background.js (Chrome Web Store ID cofdbpoegempjloogbagkncekinflcnj):
-//   - URL builder   → mN() at ~offset 529948
-//   - body builder  → IN() at ~offset 531200
-//   - fetch wrapper → JO() at ~offset 508659
-//   - app metadata  → Wo() at ~offset 16500
+// 我们发送的请求是从扩展的 background.js 逆向工程而来
+// (Chrome Web Store ID cofdbpoegempjloogbagkncekinflcnj):
+//   - URL 构建器   → mN(),偏移量约 529948
+//   - 请求体构建器  → IN(),偏移量约 531200
+//   - fetch 封装器  → JO(),偏移量约 508659
+//   - 应用元数据    → Wo(),偏移量约 16500
 const (
 	oneshotFreeEndpoint = "https://oneshot-free.www.deepl.com/v1/translate"
-	oneshotProEndpoint  = "https://oneshot-pro.www.deepl.com/v1/translate"
 
-	// Pinned to the Chrome version utls bundles into req v3 (HelloChrome_120).
-	// Keep this in lockstep with the user-agent and app_information.os_version
-	// so the TLS handshake, UA, and self-reported browser version all agree —
-	// a mismatch on any one of those is a cheap signal for the WAF.
 	impersonatedChromeMajor = "120"
 	chromeExtensionVersion  = "1.86.0"
 	chromeExtensionID       = "cofdbpoegempjloogbagkncekinflcnj"
 
-	// oneshot enforces a 1500-character hard cap on the total length of
-	// the `text` array (sum across all items). Source: the extension's
-	// own `G.notLoggedIn = 1500` constant in background.js. The server
-	// returns 400 `{"errors":{"text":["text exceeds maximum length"]}}`
-	// past this; bail early to spare the upstream and give the caller a
-	// faster, less ambiguous error.
 	maxFreeTextLength = 1500
-
-	// oneshotTimeout caps how long we wait on a single translate request.
-	// Without an explicit timeout, a hung upstream connection would
-	// dangle indefinitely and the caller (e.g. browser extension) would
-	// sit on a spinner forever — observed in the field.
-	oneshotTimeout = 20 * time.Second
-
-	// warmupTimeout caps the initial GET to www.deepl.com that seeds the
-	// cookie jar. Shorter than oneshotTimeout because warmup typically
-	// completes in well under a second; we'd rather skip a slow warmup
-	// (cookies are best-effort anyway) than block the first translation.
-	warmupTimeout = 5 * time.Second
+	oneshotTimeout    = 20 * time.Second
+	warmupTimeout     = 5 * time.Second
 )
 
-// instanceID mirrors the UUID the extension persists in chrome.storage on
-// install: stable for the life of the process, reused on every request.
-// Rotating it per-request would be a far stronger signal than reusing one.
+// instanceID 镜像扩展在安装时持久化到 chrome.storage 的 UUID:
+// 在进程生命周期内保持稳定,在每个请求中重复使用。
+// 每次请求都轮换它会是一个远为强烈的信号,远甚于复用同一个。
 var instanceID = newInstanceID()
 
-// A real extension fetch() inherits whatever cookies the browser has
-// accumulated on .deepl.com. A cold visit to www.deepl.com sets
-// userCountry=<iso2> and verifiedBot=false; users who have ever opened
-// the site additionally have _ga / _ga_<id> from analytics JS. We share
-// a process-wide cookie jar so every oneshot POST automatically carries
-// whatever the warmup GET picked up.
+// 真实的扩展 fetch() 会继承浏览器在 .deepl.com 上积累的所有 cookie。
+// 首次访问 www.deepl.com 会设置 userCountry=<iso2> 和 verifiedBot=false;
+// 曾经打开过该网站的用户还额外有来自分析 JS 的 _ga / _ga_<id>。
+// 我们共享一个进程级的 cookie jar,因此每个 oneshot POST 都会自动携带
+// 预热 GET 请求获取到的 cookie。
 var (
 	cookieJar     http.CookieJar
 	cookieJarOnce sync.Once
 	cookieWarmer  sync.Once
 )
 
-// oneshotClients caches one req.Client per proxy URL so all translate
-// calls share the underlying TCP / TLS / HTTP/2 connection pool.
-// Creating a fresh req.Client per request meant a brand-new TLS
-// handshake every time (~200-400ms of overhead on top of DeepL's own
-// ~1.5s processing latency). Reusing the client lets keep-alive +
-// session tickets cut that to near zero on the warm path.
+// oneshotClients 为每个代理 URL 缓存一个 req.Client,
+// 使所有翻译调用共享底层的 TCP / TLS / HTTP/2 连接池。
+// 每次请求都创建新的 req.Client 意味着每次都进行全新的 TLS 握手
+// (在 DeepL 自身约 1.5 秒的处理延迟之外额外增加 200-400 毫秒的开销)。
+// 复用客户端可以让 keep-alive 和会话票据在热路径上将开销降至接近零。
 var oneshotClients sync.Map // map[string]*req.Client
 
 func sharedCookieJar() http.CookieJar {
@@ -115,13 +79,13 @@ func sharedCookieJar() http.CookieJar {
 	return cookieJar
 }
 
-// warmCookies primes the shared jar by GETting www.deepl.com once.
-// The Set-Cookie response (userCountry / verifiedBot) lands on .deepl.com,
-// which is the eTLD+1 of oneshot-free.www.deepl.com, so subsequent POSTs
-// to the oneshot endpoint will carry those cookies automatically. The
-// same request doubles as a TLS-handshake warmup: it leaves a live
-// HTTP/2 connection to www.deepl.com in the client pool, which the
-// first oneshot POST then resumes via TLS session tickets.
+// warmCookies 通过向 www.deepl.com 发送一次 GET 请求来预热共享 jar。
+// Set-Cookie 响应(userCountry / verifiedBot)落在 .deepl.com 上,
+// 这是 oneshot-free.www.deepl.com 的 eTLD+1,
+// 因此后续对 oneshot 端点的 POST 会自动携带这些 cookie。
+// 同一个请求同时兼作 TLS 握手预热:它在客户端池中留下一个到
+// www.deepl.com 的活跃 HTTP/2 连接,第一个 oneshot POST 随后通过
+// TLS 会话票据恢复该连接。
 func warmCookies(client *req.Client) {
 	cookieWarmer.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
@@ -141,17 +105,16 @@ func newInstanceID() string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", s[0:8], s[8:12], s[12:16], s[16:20], s[20:32])
 }
 
-// Language code tables mirror the bundled list in the extension's
-// background.js (arrays `y` ~offset 6000 for the full target-capable
-// set, `A` for source-only aliases). Keys are the uppercase forms
-// callers pass; values are the lowercase BCP-47-ish forms the oneshot
-// endpoint expects ("de", "en-US", "zh-Hans", ...).
+// 语言代码表镜像扩展 background.js 中的内置列表
+// (数组 `y`,偏移量约 6000,包含全部支持作为目标的语言;
+// 数组 `A` 为仅作为源语言的别名)。
+// 键是调用者传入的大写形式;值是 oneshot 端点期望的小写 BCP-47 -ish 形式
+// (如 "de"、"en-US"、"zh-Hans" ...)。
 //
-// targetLangMap is what the API accepts as `target_lang`. EN and PT
-// are intentionally absent — DeepL deprecated them as target codes in
-// favour of EN-US/EN-GB and PT-BR/PT-PT, and the extension's y array
-// reflects that. We accept EN/PT as a backward-compat convenience and
-// resolve them to the regional default (en-US, pt-BR).
+// targetLangMap 是 API 接受的 `target_lang`。EN 和 PT 故意被排除--
+// DeepL 已废弃它们作为目标代码,转而使用 EN-US/EN-GB 和 PT-BR/PT-PT,
+// 扩展的 y 数组也反映了这一点。我们接受 EN/PT 作为向后兼容的便利,
+// 并将它们解析为区域默认值(en-US、pt-BR)。
 var targetLangMap = map[string]string{
 	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "EL": "el",
 	"EN-GB": "en-GB", "EN-US": "en-US",
@@ -162,16 +125,14 @@ var targetLangMap = map[string]string{
 	"RO": "ro", "RU": "ru", "SK": "sk", "SL": "sl", "SV": "sv",
 	"TR": "tr", "UK": "uk", "VI": "vi",
 	"ZH": "zh-Hans", "ZH-HANS": "zh-Hans", "ZH-HANT": "zh-Hant",
-	// Convenience aliases for legacy callers.
+	// 为旧调用者提供的便利别名
 	"EN": "en-US",
 	"PT": "pt-BR",
 }
 
-// sourceLangMap is what the API accepts as `source_lang`. It is a
-// superset of targetLangMap: EN and PT are first-class source codes
-// (extension array `A`) mapping to the generic "en"/"pt" — used when
-// the caller knows the input is English/Portuguese but does not want
-// to commit to a regional variant.
+// sourceLangMap 是 API 接受的 `source_lang`。它是 targetLangMap 的超集:
+// EN 和 PT 是一级源语言代码(扩展数组 `A`),映射为通用的 "en"/"pt"--
+// 用于调用者知道输入是英语/葡萄牙语但不想指定区域变体的情况。
 var sourceLangMap = func() map[string]string {
 	m := make(map[string]string, len(targetLangMap)+2)
 	for k, v := range targetLangMap {
@@ -182,26 +143,24 @@ var sourceLangMap = func() map[string]string {
 	return m
 }()
 
-// resolveTargetLang validates and normalizes a user-supplied target
-// language code. Returns "" and a non-nil error if the code is empty,
-// "auto", or otherwise not in the supported set.
+// resolveTargetLang 验证并规范化用户提供的目标语言代码。
+// 如果代码为空、"auto" 或不在支持的集合中,返回 "" 和非 nil 错误。
 func resolveTargetLang(code string) (string, error) {
 	if code == "" {
-		return "", fmt.Errorf("target_lang is required")
+		return "", fmt.Errorf("target_lang 为必填项")
 	}
 	if strings.EqualFold(code, "auto") {
-		return "", fmt.Errorf("target_lang cannot be \"auto\"; pick one of: %s", supportedTargetLangsList())
+		return "", fmt.Errorf("target_lang 不能为 \"auto\";请选择以下之一: %s", supportedTargetLangsList())
 	}
 	if v, ok := targetLangMap[strings.ToUpper(code)]; ok {
 		return v, nil
 	}
-	return "", fmt.Errorf("unsupported target_lang %q; valid codes: %s", code, supportedTargetLangsList())
+	return "", fmt.Errorf("不支持的 target_lang %q;有效代码: %s", code, supportedTargetLangsList())
 }
 
-// resolveSourceLang validates and normalizes a user-supplied source
-// language code. An empty string or "auto" is allowed and returns
-// ("", nil) so the caller omits source_lang and lets the server
-// autodetect.
+// resolveSourceLang 验证并规范化用户提供的源语言代码。
+// 空字符串或 "auto" 是允许的,返回 ("", nil),
+// 使调用者省略 source_lang 并让服务器自动检测。
 func resolveSourceLang(code string) (string, error) {
 	if code == "" || strings.EqualFold(code, "auto") {
 		return "", nil
@@ -209,12 +168,11 @@ func resolveSourceLang(code string) (string, error) {
 	if v, ok := sourceLangMap[strings.ToUpper(code)]; ok {
 		return v, nil
 	}
-	return "", fmt.Errorf("unsupported source_lang %q; valid codes: %s (or \"auto\")", code, supportedSourceLangsList())
+	return "", fmt.Errorf("不支持的 source_lang %q;有效代码: %s(或 \"auto\")", code, supportedSourceLangsList())
 }
 
-// supportedTargetLangsList / supportedSourceLangsList return a sorted,
-// comma-separated rendering of the supported codes for use in error
-// messages. Cached at first call.
+// supportedTargetLangsList / supportedSourceLangsList 返回排序后的、
+// 逗号分隔的支持代码列表,用于错误信息。在首次调用时缓存。
 var (
 	targetLangsListOnce sync.Once
 	targetLangsList     string
@@ -245,9 +203,8 @@ func sortedKeys(m map[string]string) string {
 	return strings.Join(keys, ", ")
 }
 
-// appInformation matches the snake_case shape produced by background.js
-// Wo({isSnakeCase: true}). Values are pinned to the same Chrome version
-// as the TLS handshake so the request tells one consistent story.
+// appInformation 匹配 background.js 中 Wo({isSnakeCase: true}) 生成的 snake_case 格式。
+// 值与 TLS 握手中固定的 Chrome 版本保持一致,使请求在各方面讲述同一个故事。
 type appInformation struct {
 	OS         string `json:"os"`
 	OSVersion  string `json:"os_version"`
@@ -256,9 +213,9 @@ type appInformation struct {
 	InstanceID string `json:"instance_id"`
 }
 
-// oneshotRequest mirrors the body assembled in background.js IN(...).
-// Field order matches the extension's object literal so the serialized
-// JSON is byte-identical (encoding/json honours struct field order).
+// oneshotRequest 镜像 background.js 中 IN(...) 构建的请求体。
+// 字段顺序与扩展的对象字面量保持一致,使序列化后的 JSON 字节完全相同
+// (encoding/json 遵循结构体字段顺序)。
 type oneshotRequest struct {
 	Text           []string       `json:"text"`
 	TargetLang     string         `json:"target_lang"`
@@ -267,21 +224,19 @@ type oneshotRequest struct {
 	AppInformation appInformation `json:"app_information"`
 }
 
-// newOneshotClient configures a req.Client whose outbound profile matches
-// a chrome-extension service-worker fetch() byte-for-byte where it can.
-// ImpersonateChrome gives us the Chrome 120 TLS ClientHello, HTTP/2
-// SETTINGS, pseudo/header order, and a sec-ch-ua/user-agent set tied to
-// the same version. It also installs a navigation-flavoured set of common
-// headers (pragma, cache-control, upgrade-insecure-requests, sec-fetch-user)
-// that a fetch() never emits — wipe those so the WAF cannot tell us apart
-// on that axis.
-// getOneshotClient returns a process-wide cached client for the given
-// proxy URL, creating it on first use. Sharing the client across
-// requests is the single biggest latency win we have on the warm path:
-// it keeps the TLS / HTTP/2 connection in the pool so subsequent
-// requests skip the handshake entirely. Kicks off cookie-jar warmup
-// in the background on first creation so that the first real translate
-// call lands on an already-established connection.
+// newOneshotClient 配置一个 req.Client,其出站配置在可能的情况下
+// 与 chrome 扩展 service-worker fetch() 逐字节匹配。
+// ImpersonateChrome 为我们提供 Chrome 120 的 TLS ClientHello、HTTP/2 SETTINGS、
+// pseudo/头顺序,以及与之绑定的 sec-ch-ua/user-agent 集合。
+// 它还安装了一组具有导航风格的常见头(pragma、cache-control、
+// upgrade-insecure-requests、sec-fetch-user),这些是 fetch() 永远不会发出的--
+// 清除它们,使 WAF 无法在此维度上区分我们。
+//
+// getOneshotClient 返回针对给定代理 URL 的进程级缓存客户端,首次使用时创建。
+// 在请求之间共享客户端是热路径上最大的延迟优化:
+// 它保持 TLS / HTTP/2 连接在池中,使后续请求完全跳过握手。
+// 在首次创建时在后台启动 cookie jar 预热,
+// 使第一个真正的翻译调用在 TLS 握手进行中就能并行运行。
 func getOneshotClient(proxyURL string) (*req.Client, error) {
 	if c, ok := oneshotClients.Load(proxyURL); ok {
 		return c.(*req.Client), nil
@@ -293,9 +248,8 @@ func getOneshotClient(proxyURL string) (*req.Client, error) {
 	if actual, loaded := oneshotClients.LoadOrStore(proxyURL, c); loaded {
 		return actual.(*req.Client), nil
 	}
-	// First time we've seen this proxy. Kick warmup off in the
-	// background so the very first translate call can run in parallel
-	// with the TLS handshake to www.deepl.com.
+	// 第一次看到这个代理。在后台启动预热,
+	// 使第一个翻译调用可以与到 www.deepl.com 的 TLS 握手并行运行。
 	go warmCookies(c)
 	return c, nil
 }
@@ -310,9 +264,9 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	} {
 		client.Headers.Del(h)
 	}
-	// Chrome 120 fetch() advertises gzip/deflate/br (zstd only appeared
-	// as a default in Chrome 123+). req's default of just "gzip" is a
-	// distinguishable signal — match Chrome explicitly.
+	// Chrome 120 的 fetch() 声明支持 gzip/deflate/br
+	// (zstd 直到 Chrome 123+ 才成为默认值)。
+	// req 的默认值仅为 "gzip",这是一个可区分的信号--明确匹配 Chrome。
 	client.SetCommonHeader("Accept-Encoding", "gzip, deflate, br")
 
 	if proxyURL != "" {
@@ -325,42 +279,34 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	return client, nil
 }
 
-// callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
-// For anonymous traffic bearerToken is empty and we send the literal
-// header `Authorization: None` — replicating the extension's JO() wrapper
-// exactly. Omitting that header instead would put the request on a
-// different server-side auth branch.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
+// callOneshot 向 oneshot 端点发送 POST 请求并返回解析后的 JSON。
+// 对于匿名流量,bearerToken 为空,我们发送字面量头
+// `Authorization: None`--精确复制扩展的 JO() 封装器。
+// 如果省略该头,请求将被置于不同的服务端认证分支。
+func callOneshot(endpoint string, body []byte, proxyURL string) (gjson.Result, int, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
 		return gjson.Result{}, 0, err
-	}
-
-	authValue := "None"
-	if bearerToken != "" {
-		authValue = "Bearer " + bearerToken
 	}
 
 	resp, err := client.R().
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Accept", "*/*").
-		SetHeader("Authorization", authValue).
+		SetHeader("Authorization", "None").
 		SetHeader("Origin", "chrome-extension://"+chromeExtensionID).
 		SetHeader("Sec-Fetch-Site", "cross-site").
 		SetHeader("Sec-Fetch-Mode", "cors").
 		SetHeader("Sec-Fetch-Dest", "empty").
-		SetBodyBytes(body). // SetBodyBytes pins Content-Length; using an
-		// io.Reader instead forces Transfer-Encoding: chunked, which a
-		// real fetch() with JSON.stringify body never emits.
+		SetBodyBytes(body).
 		Post(endpoint)
 	if err != nil {
 		return gjson.Result{}, 0, err
 	}
 	defer resp.Body.Close()
 
-	// Once we set Accept-Encoding ourselves, Go's HTTP stack stops
-	// transparently decompressing, so handle gzip/deflate/br by hand.
+	// 一旦我们手动设置了 Accept-Encoding,Go 的 HTTP 栈就会停止
+	// 透明解压,因此手动处理 gzip/deflate/br。
 	var reader io.Reader = resp.Body
 	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
 	case "gzip":
@@ -377,16 +323,13 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 	}
 	raw, err := io.ReadAll(reader)
 	if err != nil {
-		return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+		return gjson.Result{}, resp.StatusCode, fmt.Errorf("读取响应体: %w", err)
 	}
 	return gjson.ParseBytes(raw), resp.StatusCode, nil
 }
 
-// TranslateByDeepLX performs translation via the DeepL oneshot endpoint.
-// Passing dlSession switches to the Pro endpoint; the value is sent
-// verbatim as the Bearer token (i.e. it must be an OAuth access token,
-// not the legacy dl_session cookie).
-func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DeepLXTranslationResult, error) {
+// TranslateByDeepLX 通过 DeepL oneshot 端点执行翻译。
+func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, proxyURL string) (DeepLXTranslationResult, error) {
 	if text == "" {
 		return DeepLXTranslationResult{
 			Code:    http.StatusNotFound,
@@ -419,7 +362,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	reqStruct := oneshotRequest{
 		Text:       []string{text},
 		TargetLang: resolvedTarget,
-		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
+		SourceLang: resolvedSource, // 空值 = 自动检测;omitempty 会省略该字段
 		UsageType:  "Translate",
 		AppInformation: appInformation{
 			OS:         "brex_macOS",
@@ -431,22 +374,17 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	}
 	bodyBytes, _ := json.Marshal(reqStruct)
 
-	endpoint := oneshotFreeEndpoint
-	if dlSession != "" {
-		endpoint = oneshotProEndpoint
-	}
-
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL)
+	result, status, err := callOneshot(oneshotFreeEndpoint, bodyBytes, proxyURL)
 	if err != nil {
-		// Map upstream timeouts to 504 so callers can distinguish "DeepL
-		// took too long" from other 503 failure modes (DNS, TLS, etc.).
+		// 将上游超时映射为 504,使调用者可以区分 "DeepL 耗时过长"
+		// 与其他 503 故障模式(DNS、TLS 等)。
 		var ue *url.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ue) && ue.Timeout()) {
 			return DeepLXTranslationResult{
 				ID:      id,
 				Code:    http.StatusGatewayTimeout,
-				Message: fmt.Sprintf("upstream DeepL request timed out after %s", oneshotTimeout),
+				Message: fmt.Sprintf("上游 DeepL 请求在 %s 后超时", oneshotTimeout),
 			}, nil
 		}
 		return DeepLXTranslationResult{
@@ -458,18 +396,18 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	switch status {
 	case http.StatusOK:
-		// fall through to body parsing
+		// 继续执行响应体解析
 	case http.StatusTooManyRequests:
 		return DeepLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusTooManyRequests,
-			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
+			Message: "请求过于频繁,您的 IP 已被 DeepL 临时封禁,请勿在短时间内频繁请求",
 		}, nil
 	default:
 		return DeepLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: fmt.Sprintf("request failed with status code: %d", status),
+			Message: fmt.Sprintf("请求失败,状态码: %d", status),
 		}, nil
 	}
 
@@ -478,7 +416,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		return DeepLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: "Translation failed",
+			Message: "翻译失败",
 		}, nil
 	}
 
@@ -487,7 +425,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		return DeepLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: "Translation failed",
+			Message: "翻译失败",
 		}, nil
 	}
 
@@ -499,9 +437,9 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		Code:         http.StatusOK,
 		ID:           id,
 		Data:         mainText,
-		Alternatives: nil, // oneshot does not return alternatives
+		Alternatives: nil, // oneshot 不返回备选翻译
 		SourceLang:   sourceLang,
 		TargetLang:   targetLang,
-		Method:       map[bool]string{true: "Pro", false: "Free"}[dlSession != ""],
+		Method:       "Free",
 	}, nil
 }

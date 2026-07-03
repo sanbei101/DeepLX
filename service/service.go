@@ -1,15 +1,3 @@
-/*
- * @Author: Vincent Yang
- * @Date: 2023-07-01 21:45:34
- * @LastEditors: Jason Lyu
- * @LastEditTime: 2025-04-08 13:45:00
- * @FilePath: /DeepLX/main.go
- * @Telegram: https://t.me/missuo
- * @GitHub: https://github.com/missuo
- *
- * Copyright © 2024 by Vincent, All Rights Reserved.
- */
-
 package service
 
 import (
@@ -26,13 +14,14 @@ import (
 	"github.com/OwO-Network/DeepLX/translate"
 )
 
+// authMiddleware 创建一个基于令牌的认证中间件
 func authMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if cfg.Token != "" {
 			providedTokenInQuery := c.Query("token")
 			providedTokenInHeader := c.GetHeader("Authorization")
 
-			// Compatability with the Bearer token format
+			// 兼容 Bearer 令牌格式
 			if providedTokenInHeader != "" {
 				parts := strings.Split(providedTokenInHeader, " ")
 				if len(parts) == 2 {
@@ -67,15 +56,8 @@ type PayloadFree struct {
 	TagHandling string `json:"tag_handling"`
 }
 
-type PayloadAPI struct {
-	Text        []string `json:"text"`
-	TargetLang  string   `json:"target_lang"`
-	SourceLang  string   `json:"source_lang"`
-	TagHandling string   `json:"tag_handling"`
-}
-
 func Router(cfg *Config) *gin.Engine {
-	// Set Proxy
+	// 设置代理
 	proxyURL := os.Getenv("PROXY")
 	if proxyURL == "" {
 		proxyURL = cfg.Proxy
@@ -83,7 +65,7 @@ func Router(cfg *Config) *gin.Engine {
 	if proxyURL != "" {
 		proxy, err := url.Parse(proxyURL)
 		if err != nil {
-			log.Fatalf("Failed to parse proxy URL: %v", err)
+			log.Fatalf("解析代理 URL 失败: %v", err)
 		}
 		http.DefaultTransport = &http.Transport{
 			Proxy: http.ProxyURL(proxy),
@@ -91,13 +73,13 @@ func Router(cfg *Config) *gin.Engine {
 	}
 
 	if cfg.Token != "" {
-		fmt.Println("Access token is set.")
+		fmt.Println("已设置访问令牌。")
 	}
 
 	r := gin.Default()
 	r.Use(cors.Default())
 
-	// Defining the root endpoint which returns the project details
+	// 根端点,返回项目信息
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"code":    http.StatusOK,
@@ -105,7 +87,7 @@ func Router(cfg *Config) *gin.Engine {
 		})
 	})
 
-	// Free API endpoint, No Pro Account required
+	// 免费 API 端点,无需 Pro 账号
 	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
 		req := PayloadFree{}
 		if err := c.BindJSON(&req); err != nil {
@@ -131,9 +113,9 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL)
 		if err != nil {
-			log.Printf("Translation failed: %s", err)
+			log.Printf("翻译失败: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"code":    http.StatusInternalServerError,
 				"message": "Translation failed",
@@ -160,137 +142,7 @@ func Router(cfg *Config) *gin.Engine {
 		}
 	})
 
-	// Pro API endpoint, Pro Account required
-	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {
-		req := PayloadFree{}
-		if err := c.BindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"code":    http.StatusBadRequest,
-				"message": "Invalid request payload",
-			})
-			return
-		}
-
-		sourceLang := req.SourceLang
-		targetLang := req.TargetLang
-		translateText := req.TransText
-		tagHandling := req.TagHandling
-		proxyURL := cfg.Proxy
-
-		dlSession := cfg.DlSession
-
-		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"code":    http.StatusBadRequest,
-				"message": "Invalid tag_handling value. Allowed values are 'html' and 'xml'.",
-			})
-			return
-		}
-
-		cookie := c.GetHeader("Cookie")
-		if cookie != "" {
-			dlSession = strings.Replace(cookie, "dl_session=", "", -1)
-		}
-
-		if dlSession == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "No dl_session Found",
-			})
-			return
-		} else if strings.Contains(dlSession, ".") {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Your account is not a Pro account. Please upgrade your account or switch to a different account.",
-			})
-			return
-		}
-
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
-		if err != nil {
-			log.Printf("Translation failed: %s", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    http.StatusInternalServerError,
-				"message": "Translation failed",
-			})
-			return
-		}
-
-		if result.Code == http.StatusOK {
-			c.JSON(http.StatusOK, gin.H{
-				"code":         http.StatusOK,
-				"id":           result.ID,
-				"data":         result.Data,
-				"alternatives": result.Alternatives,
-				"source_lang":  result.SourceLang,
-				"target_lang":  result.TargetLang,
-				"method":       result.Method,
-			})
-		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-
-		}
-	})
-
-	// Free API endpoint, Consistent with the official API format
-	r.POST("/v2/translate", authMiddleware(cfg), func(c *gin.Context) {
-		proxyURL := cfg.Proxy
-
-		var translateText string
-		var targetLang string
-
-		translateText = c.PostForm("text")
-		targetLang = c.PostForm("target_lang")
-
-		if translateText == "" || targetLang == "" {
-			var jsonData struct {
-				Text       []string `json:"text"`
-				TargetLang string   `json:"target_lang"`
-			}
-
-			if err := c.BindJSON(&jsonData); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"code":    http.StatusBadRequest,
-					"message": "Invalid request payload",
-				})
-				return
-			}
-
-			translateText = strings.Join(jsonData.Text, "\n")
-			targetLang = jsonData.TargetLang
-		}
-
-		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", proxyURL, "")
-		if err != nil {
-			log.Printf("Translation failed: %s", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    http.StatusInternalServerError,
-				"message": "Translation failed",
-			})
-			return
-		}
-
-		if result.Code == http.StatusOK {
-			c.JSON(http.StatusOK, gin.H{
-				"translations": []map[string]interface{}{
-					{
-						"detected_source_language": result.SourceLang,
-						"text":                     result.Data,
-					},
-				},
-			})
-		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-		}
-	})
-
-	// Catch-all route to handle undefined paths
+	// 捕获未定义路径
 	r.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"code":    http.StatusNotFound,
